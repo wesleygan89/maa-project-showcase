@@ -367,18 +367,96 @@ This ensures agents produce output that is idiomatic and consistent with the tar
 
 ---
 
-## Prompt Engineering
+## Under The Hood — Engineering Depth
 
-The system includes a suite of reusable prompt templates for common development operations:
+This is where MAA goes well beyond a simple "call agents in sequence" script. Several non-trivial problems had to be solved.
 
-| Prompt | Purpose |
-|--------|---------|
-| `implement-gh-issue` | Implement a GitHub issue end-to-end |
-| `plan-gh-issue` | Create a structured implementation plan from an issue |
-| `generate-sub-issue` | Decompose an issue into focused, actionable sub-issues |
-| `clarify-requirements` | Generate clarification questions for ambiguous requirements |
-| `architecture-blueprint-generator` | Generate architecture blueprints from requirements |
-| `release-story-status-analyzer` | Analyse release readiness across user stories |
+---
+
+### Dynamic Pipeline — Stages Injected at Runtime
+
+The workflow stage list is **not static**. After the Tech Lead completes its assessment, it can instruct the orchestrator to dynamically inject new subtask stages into the running pipeline — each with its own QA → Dev → Tech Review cycle — before the main pipeline resumes:
+
+```mermaid
+flowchart LR
+    A[Static Pipeline\n10 predefined stages] -->|Tech Lead decomposes| B[Runtime Injection\nsubtask stages inserted\nat current index]
+    B --> C[Dynamic Pipeline\n10 + N×3 stages\nexecuted in order]
+```
+
+The injector resolves which developer agent to assign through **5 fallback tiers**: explicit tech-stack in control block → explicit agent name → `**Assigned Developer:**` pattern in Tech Lead output → persisted assignment from earlier stage → repo config default.
+
+---
+
+### Three-Tier Intent Routing
+
+The Tech Lead's orchestration decisions are parsed through a three-tier strategy — tried in order until one succeeds:
+
+| Tier | Method | How it works |
+|------|--------|--------------|
+| **1 — Explicit control block** | Structured JSON in output | Tech Lead emits a `WORKFLOW_CONTROL` JSON block; parsed directly |
+| **2 — Natural language analysis** | Regex intent patterns | Detects phrases like _"returning to developer"_, _"code approved"_, _"orchestrating subtask 3"_ |
+| **3 — Stage heuristics** | Rule-based fallback | Safe defaults based on stage type if no signal found in output |
+
+This means agents don't need to produce perfectly structured output — the system understands natural language routing decisions.
+
+---
+
+### Spec-Kit: Human-in-the-Loop Clarification
+
+The BA agent implements GitHub's Spec-Kit methodology. If requirements are ambiguous, the BA emits a structured clarification block and the **entire workflow pauses**:
+
+```
+<<<SPEC_KIT_CLARIFICATION>>>
+QUESTIONS:
+1. What is the expected behaviour when a user uploads a file > 10MB?
+2. Should activity history persist after account deletion?
+SEVERITY: blocking
+CONTEXT: These gaps prevent writing accurate Gherkin acceptance criteria.
+<<<END_SPEC_KIT_CLARIFICATION>>>
+```
+
+The orchestrator detects this signal, presents the questions in the terminal, waits for the user to type answers and `DONE`, then injects the answers as corrections and **re-runs the BA stage** with the clarified context. Up to 2 rounds allowed before the workflow proceeds anyway.
+
+---
+
+### Self-Healing Review Loops
+
+When the Security Engineer or System Architect **rejects** a deliverable, the orchestrator doesn't just log the failure — it automatically injects a `TECH_LEAD_FIX` stage followed by a re-review stage into the live pipeline:
+
+```mermaid
+flowchart LR
+    ARCH[Architect Review] -->|rejected| FIX[Injected:\nTech Lead Fix Stage]
+    FIX --> REREVIEW[Injected:\nArchitect Re-review]
+    REREVIEW -->|approved| NEXT[Next Stage]
+    REREVIEW -->|rejected again| FIX
+```
+
+This loop is distinct from the subtask loop — fix-orchestration stages skip the QA → Dev cycle and escalate directly back to the reviewer.
+
+---
+
+### Context Management at Scale
+
+Long pipelines accumulate large amounts of prior agent output as context. Two mechanisms prevent token limits from breaking later stages:
+
+**1. Context offloading** — sections over 5KB (prior agent outputs, reference docs, repo structure) are written to disk and replaced with a file reference in the prompt. The agent reads the file via its tools rather than receiving it inline.
+
+**2. LLMlingua compression pipeline** — if the prompt still exceeds 50KB after offloading, it is passed through a compression pipeline (LLMlingua → Grok) that reduces token count while preserving semantic meaning. Compression stats are logged per stage.
+
+Both are transparent to the agents and require no changes to agent definitions.
+
+---
+
+### Model Routing Per Agent Role
+
+Not all agents use the same model. The orchestrator routes each agent to the optimal model for its role:
+
+| Agent type | Model | Rationale |
+|-----------|-------|-----------|
+| PM, BA, Tech Lead, Architect | `grok-code-fast-1` | Planning and analysis — fast, lower cost |
+| Developer, QA, Security, DevOps | `claude-sonnet-4.6` | Code generation and implementation — higher quality |
+
+This is resolved per session, not globally — the same pipeline can use both models in a single run.
 
 ---
 
@@ -402,12 +480,71 @@ After each agent completes, an intent analyzer validates output quality against 
 
 ---
 
+## GitHub Copilot SDK Integration
+
+MAA is built directly on top of the `@github/copilot-sdk` — the programmatic interface to GitHub Copilot's model and tool execution layer. This is what makes fully automated, headless agent execution possible without any UI interaction.
+
+### How the SDK Is Used
+
+```mermaid
+sequenceDiagram
+    participant WM as Workflow Manager
+    participant SDK as CopilotClient (SDK)
+    participant S as Session
+    participant A as Agent (e.g. Tech Lead)
+    participant TR as Target Repository
+
+    WM->>SDK: new CopilotClient({ autoStart: true })
+    SDK-->>WM: client ready
+
+    loop For each workflow stage
+        WM->>SDK: client.createSession({ model, systemMessage, workingDirectory })
+        SDK-->>WM: session
+
+        WM->>WM: buildAgentPrompt() — inject context, corrections, compressed history
+        WM->>S: session.sendMessage(prompt)
+
+        S-->>WM: stream assistant.message events (real-time chunks)
+        S->>TR: tool calls (read_file, grep_search, run_in_terminal, etc.)
+        TR-->>S: tool results
+        S-->>WM: idle event — agent done
+
+        WM->>WM: Intent analysis — validate output quality
+        WM->>WM: Checkpoint state to disk
+        WM->>WM: Pass output as context to next stage
+    end
+
+    WM->>SDK: client.stop()
+```
+
+### Key SDK Interactions
+
+| Interaction | Details |
+|-------------|---------|
+| **Session per agent** | Each pipeline stage creates a fresh `client.createSession()` with the agent's system message injected as `type: "replace"` |
+| **Model selection** | Planning/analysis agents (PM, BA, Tech Lead, Architect) use `grok-code-fast-1`; implementation agents use `claude-sonnet-4.6` |
+| **Working directory** | Set to the target repository path so file tools operate on the correct codebase |
+| **Streaming** | `assistant.message` events deliver content chunks in real-time; forwarded to the live dashboard and terminal |
+| **Idle detection** | `idle` event signals the agent has finished all tool calls and produced its final output |
+| **Tool access** | Agents call VS Code Copilot tools (`read_file`, `grep_search`, `semantic_search`, `run_in_terminal`, etc.) to interact with the codebase |
+
+### Why the SDK vs. Chat UI
+
+Using the SDK directly lets the orchestrator:
+- **Drive agents programmatically** — no human needs to press send between stages
+- **Inject dynamic context** — prior agent outputs, corrections, and compressed history are assembled per-stage before the prompt is sent
+- **React to events** — idle detection, tool call counting, and checkpoint triggers are all event-driven
+- **Apply quality gates** — intent analysis runs on the raw output before any context is forwarded
+
+---
+
 ## Technology Stack
 
 | Component | Technology |
 |-----------|-----------|
 | Runtime | Node.js 18+ (ESM) |
 | AI SDK | `@github/copilot-sdk` v0.1.23 |
+| Models | `claude-sonnet-4.6` (implementation), `grok-code-fast-1` (planning) |
 | Scripting | PowerShell 7 |
 | Live Streaming | Node.js HTTP server + Server-Sent Events |
 | Agent Definitions | VS Code `.agent.md` format |
