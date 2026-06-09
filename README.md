@@ -40,8 +40,14 @@ MAA replaces this entire flow with an automated, role-aware agent pipeline that 
 | **14+ Specialized Agents** | PM, BA, Tech Lead, Developer (stack-specific), QA, Architect, Security, DevOps, Researcher, and more |
 | **LangGraph State Machine** | Workflow pipeline modelled as a typed `StateGraph` with formal reducers, thread-isolated checkpointing, and time-travel debugging |
 | **Corrective RAG (CRAG)** | Five-node retrieval pipeline — query generator, retriever, LLM grader, query rewriter, executor — fetches only the most relevant reference docs per agent stage |
-| **Arize Phoenix Observability** | Full OpenTelemetry tracing to a local Phoenix instance — visualise every workflow → stage → LLM call → tool call span in real time |
-| **Dynamic Skills System** | 10 modular domain-knowledge packs (TDD, Security, Architecture, etc.) injected only when relevant to the current agent + stage + workflow |
+| **Arize Phoenix Observability** | Full OpenTelemetry tracing + heartbeat nodes — visualise every workflow → stage → LLM call → tool call span, with stall detection per graph node |
+| **Dynamic Skills System** | 11 modular domain-knowledge packs (TDD, Security, Architecture, Code Review, etc.) injected only when relevant to the current agent + stage + workflow |
+| **Automated Test Runner** | Independently executes the test suite after every developer implementation — agents cannot self-certify; the test runner verifies pass/fail directly |
+| **AC-ID Coverage Verification** | Post-workflow script verifies every acceptance criterion from the BA BRD was mapped to a subtask, implemented, and covered by at least one test |
+| **Developer File Guard** | Snapshots uncommitted developer files before QA/review stages and restores any files a QA agent destructively reverted |
+| **Requirements Digest** | Extracts AC-IDs, architectural decisions, and file targets from BA + Tech Lead outputs into a compact digest injected into developer prompts |
+| **Agent Question Log** | Agents surface questions/concerns to `docs/questions/` during execution — persisted for asynchronous human review |
+| **Per-Role Model Routing** | 4-model routing strategy: Gemini 3.1 Pro (QA), GPT-5.3 Codex (Tech Lead), GPT-5.4 Mini (planning), Claude Sonnet 4.6 (implementation) |
 | **Multi-Repository Support** | Switch between Next.js, NestJS, .NET, and Node.js/TypeORM projects with a single command |
 | **LangGraph Checkpointing** | `FileSystemSaver` implements `BaseCheckpointSaver` — full checkpoint history per thread, resume from any prior state |
 | **Subtask Orchestration** | Tech Lead auto-decomposes complex tasks into subtasks, each with their own QA → Dev → Review TDD cycle |
@@ -421,29 +427,37 @@ flowchart LR
     S([START]) --> RS
 
     RS[routeStage\nFind next stage\nor signal END]
+    HB1[💓 hb_ragPipeline]
     QG[queryGenerator\nCache-check gate]
     RET[retriever\nTF-IDF RAG fetch]
+    HB2[💓 hb_grading]
     GR[grader\nLLM relevance\njudge]
     QRW[queryRewrite\nImprove query\n& retry]
+    HB3[💓 hb_executing]
     EX[executeStage\nCopilot SDK\nagent call]
+    HB4[💓 hb_postProcessing]
     PP[postProcess\nUpdate stage status\n& state merge]
+    HB5[💓 hb_routing]
     E([END])
 
-    RS -->|stages remain| QG
+    RS -->|stages remain| HB1
     RS -->|all done| E
 
-    QG -->|cache hit| EX
+    HB1 --> QG
+    QG -->|cache hit| HB3
     QG -->|retrieval needed| RET
 
-    RET --> GR
-    GR -->|relevant| EX
+    RET --> HB2 --> GR
+    GR -->|relevant| HB3
     GR -->|irrelevant + rewrites left| QRW
-    GR -->|irrelevant + max rewrites| EX
+    GR -->|irrelevant + max rewrites| HB3
 
     QRW -->|rewritten query| RET
 
-    EX --> PP --> RS
+    HB3 --> EX --> HB4 --> PP --> HB5 --> RS
 ```
+
+**Heartbeat nodes** (`hb_*`) are lightweight OpenTelemetry spans inserted at every major graph transition. If a Phoenix trace stalls, the last completed heartbeat pinpoints exactly which node is hung — no guesswork required.
 
 ### State Schema
 
@@ -701,12 +715,93 @@ Both are transparent to the agents and require no changes to agent definitions.
 
 Not all agents use the same model. The orchestrator routes each agent to the optimal model for its role:
 
-| Agent type | Model | Rationale |
-|-----------|-------|-----------|
-| PM, BA, Tech Lead, Architect | `grok-code-fast-1` | Planning and analysis — fast, lower cost |
-| Developer, QA, Security, DevOps | `claude-sonnet-4.6` | Code generation and implementation — higher quality |
+| Agent | Model | Rationale |
+|-------|-------|-----------|
+| QA Automation Engineer | `gemini-3.1-pro` | Test creation & validation — precise, deterministic |
+| Tech Lead | `gpt-5.3-codex` | Orchestration, task decomposition & code review |
+| PM, BA, Security Engineer, Architect | `gpt-5.4-mini` | Planning, analysis & review — fast, lower cost |
+| All Developers, DevOps, Researcher | `claude-sonnet-4.6` (default) | Code generation & implementation |
 
-This is resolved per session, not globally — the same pipeline can use both models in a single run.
+This is resolved per session via `model-selector.js` — the same pipeline uses up to 4 different models in a single run.
+
+### Automated Test Runner — Trust Enforcement
+
+Agents cannot self-certify their work. After every `DEV_IMPLEMENTATION` stage (including each subtask's dev stage), the test runner **independently executes the actual test suite** against the target repository:
+
+```mermaid
+flowchart TD
+    DEV[Developer implements feature] --> TR
+    TR{Test Runner\nruns repo tests}
+    TR -->|all pass| NEXT[Proceed to QA Validation]
+    TR -->|failures| RETRY[Developer receives\nfailure output + fix prompt]
+    RETRY --> DEV2[Developer retries]
+    DEV2 --> TR
+    TR -->|still failing after 10 attempts| ESCALATE[Escalate with full\nfailure context]
+```
+
+The test runner handles real-world messiness:
+- **Auto-discovery** — finds the test setup even in nested monorepos by scanning for `package.json` and build scripts
+- **Delegation detection** — follows `cd subdir && npm test` patterns in agent output
+- **Error classification** — distinguishes infrastructure errors (ENOENT, EACCES) from real test failures, avoiding false retries on environment issues
+- **Type-strip compatibility** — detects Node 22+ built-in TS stripping conflicts with project transpilers (ts-jest, tsx, ts-node) and adjusts flags
+- **Circuit breaker** — detects repeated identical errors and stops retrying to avoid burning tokens on unfixable issues
+- **Max retry cap** — 10 iterations maximum before escalating
+
+---
+
+### Developer File Guard
+
+QA agents run git operations (`git restore`, `git clean`, `git checkout -- .`) to reset the working tree before running tests. This historically caused them to wipe uncommitted developer work, then falsely claim "the developer didn't implement anything."
+
+The Dev Work Guard solves this by **snapshotting all uncommitted and untracked files before every QA or review stage**, then restoring any files the agent deleted:
+
+```
+Before QA stage:  Snapshot { path → Buffer } for all git-modified + untracked files
+During QA stage:  QA agent runs normally (may run git restore)
+After QA stage:   Diff snapshot vs current state → restore any missing/reverted files
+```
+
+No git commits required. The developer's work is always preserved.
+
+---
+
+### AC-ID Coverage Verification
+
+After a workflow completes, the coverage verifier cross-checks that the pipeline delivered what it promised:
+
+```
+BA BRD  →  AC-IDs extracted  →  Verify each AC-ID was:
+                                  1. Mapped to a subtask by Tech Lead
+                                  2. Implemented in target codebase (grep)
+                                  3. Covered by at least one test
+```
+
+```powershell
+npm run verify:coverage          # Standard report
+npm run verify:coverage:verbose  # Full detail per AC-ID
+```
+
+Gaps are reported per AC-ID so any missed requirements are immediately actionable.
+
+---
+
+### Requirements Digest
+
+Instead of cascading full multi-KB agent outputs into every developer prompt (which bloats context and buries the signal), the Requirements Digest **extracts and compresses exactly what a developer needs**:
+
+- Every **AC-ID** from the BA BRD with its description
+- **Architectural decisions** from the Tech Lead (file locations, patterns, conventions)
+- **Target files** the Tech Lead specified
+- **Constraints** (what NOT to change, backward compatibility rules)
+- For subtasks: a **prior subtask summary** (what was already implemented)
+
+This replaces hundreds of lines of prose with a focused structured block — injected directly above the test spec in the developer's prompt.
+
+---
+
+### Agent Question Log
+
+Agents surface questions, assumptions, and concerns as a structured log during execution, persisted to `docs/questions/<taskId>-questions.md`. This gives reviewers a post-run record of where agents were uncertain — without blocking workflow execution.
 
 ---
 
@@ -791,12 +886,14 @@ Using the SDK directly lets the orchestrator:
 ## Technology Stack
 
 | Component | Technology |
-|-----------|-----------|
+|-----------|------------|
 | Runtime | Node.js 18+ (ESM) |
-| AI SDK | `@github/copilot-sdk` v0.1.23 || State Machine | `@langchain/langgraph` v1.2 — typed `StateGraph` with custom `BaseCheckpointSaver` |
+| AI SDK | `@github/copilot-sdk` v0.1.23 |
+| State Machine | `@langchain/langgraph` v1.2 — typed `StateGraph` with custom `BaseCheckpointSaver` |
 | RAG Embeddings | TF-IDF (pure JS, zero dependencies) — pluggable interface |
 | Observability | Arize Phoenix + OpenTelemetry OTLP (`@opentelemetry/sdk-trace-node`) |
-| OpenInference | `@arizeai/openinference-semantic-conventions` || Models | `claude-sonnet-4.6` (implementation), `grok-code-fast-1` (planning) |
+| OpenInference | `@arizeai/openinference-semantic-conventions` |
+| Models | Gemini 3.1 Pro (QA), GPT-5.3 Codex (Tech Lead), GPT-5.4 Mini (planning), Claude Sonnet 4.6 (default) |
 | Scripting | PowerShell 7 |
 | Live Streaming | Node.js HTTP server + Server-Sent Events |
 | Agent Definitions | VS Code `.agent.md` format |
@@ -808,7 +905,7 @@ Using the SDK directly lets the orchestrator:
 
 ```
 MAA/
-├── workflow-manager.js            # Core orchestrator
+├── workflow-manager.js            # Core orchestrator (lean entrypoint)
 ├── workflow-specialist-agent.js   # Workflow analysis & metrics
 ├── workflow-logger.js             # Structured logging + live streaming
 ├── checkpoint-utils.js            # Legacy checkpoint utilities
@@ -819,13 +916,28 @@ MAA/
 │   ├── code-review-workflow.js    # Iterative review loop
 │   └── shared/
 │       ├── deferral-detector.js   # Agent deferral detection
-│       └── rate-limiter.js        # Exponential backoff retry
+│       ├── rate-limiter.js        # Exponential backoff retry
+│       └── state-manager.js       # Workflow state I/O
 │
 ├── lib/                           # Modular engine components
+│   ├── lifecycle/                 # 🔄 Startup & shutdown (new_version)
+│   │   ├── workflow-initializer.js # SDK, tracing, agents, skills init
+│   │   └── signal-handler.js      # Graceful SIGINT/SIGTERM shutdown
+│   ├── stage/                     # 🎮 Per-stage operations (new_version)
+│   │   ├── post-stage-router.js   # All post-stage routing logic
+│   │   ├── test-runner.js         # Automated test execution & retry
+│   │   ├── dev-work-guard.js      # Snapshot/restore developer files
+│   │   ├── subtask-validator.js   # Subtask progression enforcement
+│   │   └── question-logger.js     # Agent question persistence
+│   ├── execution/                 # 💻 SDK session lifecycle (new_version)
+│   │   ├── session-handler.js     # Copilot SDK session & streaming
+│   │   ├── checkpoint-handler.js  # Periodic & emergency checkpoints
+│   │   └── debug-utils.js         # Debug file naming & saving
 │   ├── langgraph/                 # 🔗 LangGraph integration
-│   │   ├── workflow-graph.js      # StateGraph definition + CRAG nodes wiring
+│   │   ├── workflow-graph.js      # StateGraph definition + edge wiring
 │   │   ├── state-annotation.js    # Typed state channels with reducers
 │   │   ├── rag-nodes.js           # CRAG: queryGenerator, retriever, grader, rewriter
+│   │   ├── heartbeat-nodes.js     # OTel heartbeat spans between graph nodes
 │   │   ├── file-checkpointer.js   # FileSystemSaver (BaseCheckpointSaver impl)
 │   │   └── langgraph-state-manager.js  # Drop-in state manager API
 │   ├── rag/                       # 🔍 RAG pipeline
@@ -838,24 +950,36 @@ MAA/
 │   │   └── phoenix-tracer.js      # OTel OTLP exporter + OpenInference spans
 │   ├── skills/                    # 🎓 Skills system
 │   │   └── skill-loader.js        # Load & match skills to agent+stage+workflow
-│   ├── agents/agent-loader.js     # Loads agent definitions from .agent.md files
+│   ├── agents/
+│   │   ├── agent-loader.js        # Loads agent definitions from .agent.md files
+│   │   └── model-selector.js      # Per-agent model routing (4 models)
+│   ├── prompt/
+│   │   ├── prompt-builder.js      # Builds agent prompts with context
+│   │   ├── requirements-digest.js # Compact BA+TL digest for developer prompts
+│   │   ├── prompt-compressor.js   # LLMlingua compression pipeline
+│   │   └── prompt-extractor.js    # Extracts next-agent prompts from output
 │   ├── context/context-loader.js  # Reference doc caching & loading
 │   ├── intent/intent-analyzer.js  # Output quality + NLU routing
 │   ├── orchestration/             # Tech Lead subtask management
-│   ├── prompt/                    # Prompt building & LLMlingua compression
 │   ├── interactive/               # Mid-workflow corrections
 │   └── spec-kit/                  # BA requirements quality gate
 │
 ├── langgraph-checkpoints/         # Per-thread checkpoint JSON files
 │
+├── scripts/
+│   ├── verify-ac-coverage.js      # Post-workflow AC-ID coverage verification
+│   ├── render-mermaid-diagrams.js # Render diagrams to PNG
+│   └── workflow-automation/       # PowerShell workflow automation scripts
+│
 ├── .github/
 │   ├── agents/                    # 14+ agent definitions (.agent.md)
-│   ├── skills/                    # 10 domain skill packs (SKILL.md)
+│   ├── skills/                    # 11 domain skill packs (SKILL.md)
 │   ├── instructions/              # Stack-specific coding standards
 │   ├── prompts/                   # Reusable prompt templates
 │   ├── chatmodes/                 # Custom VS Code chat modes
 │   └── runbooks/                  # Workflow runbooks
 │
+├── docs/questions/                # Agent question logs (auto-generated)
 ├── repo-config.json               # Multi-repository configuration
 ├── repo-config.schema.json        # Config JSON Schema
 ├── run-workflow.ps1               # Workflow launcher
@@ -867,6 +991,18 @@ MAA/
 ---
 
 ## Design Decisions
+
+**Why a test runner instead of trusting agents?**  
+Agents will claim their code passes tests without running them, or selectively report partial results. An independent test runner that executes the actual test suite eliminates this entirely — the score comes from the real test output, not the agent's narration.
+
+**Why a developer file guard?**  
+QA agents legitimately need a clean git working tree to reset and re-run tests. Without the guard, they reset it — wiping uncommitted developer work — then falsely declare nothing was implemented. Snapshotting before and restoring after gives QA the clean state it needs without destroying developer progress.
+
+**Why AC-ID coverage verification?**  
+The pipeline produces a lot of output but the question that matters is whether every acceptance criterion actually got implemented and tested. The verifier gives a binary, traceable answer per AC-ID rather than relying on agents to self-report completeness.
+
+**Why heartbeat nodes in the LangGraph graph?**  
+Long-running agent sessions can take minutes. Without heartbeats, a stalled Phoenix trace shows a span that started but never ended — impossible to tell which node is hung. Heartbeat spans complete instantly and mark each transition, so the last finished heartbeat identifies the exact failure point.
 
 **Why GitHub Copilot SDK?**  
 The SDK provides direct, programmatic access to Copilot's model routing and tool execution, allowing the orchestrator to drive agents without UI interaction.
